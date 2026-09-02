@@ -2047,8 +2047,11 @@ impl Config {
                 );
             }
             if let Some(ref id) = model.model_provider
-                && !config.model_providers.contains_key(id)
-                && !declared_model_provider_names.contains(id.as_str())
+                && !crate::agent::provider_profiles::provider_is_known(
+                    &config.model_providers,
+                    &declared_model_provider_names,
+                    id,
+                )
             {
                 config.config_warnings.push(
                     super::config_model_override_parse::ConfigWarning::model(
@@ -2056,9 +2059,9 @@ impl Config {
                         Some("model_provider"),
                         super::config_model_override_parse::ConfigWarningKind::InvalidValue,
                         format!(
-                            "references [model_providers.{id}], which is not defined; \
-                             provider defaults are not applied — the model uses its own \
-                             credential if set, otherwise fails closed on a custom endpoint"
+                            "references [model_providers.{id}], which is not defined and is not a \
+                             built-in provider; provider defaults are not applied — the model uses \
+                             its own credential if set, otherwise fails closed on a custom endpoint"
                         ),
                     ),
                 );
@@ -3469,8 +3472,8 @@ pub(crate) fn resolve_model_list(
             }
         }
         let with_provider = model_override.model_provider.as_deref().map(|pid| {
-            match cfg.model_providers.get(pid) {
-                Some(provider) => model_override.with_provider_defaults(provider, pid),
+            match crate::agent::provider_profiles::resolve_provider(&cfg.model_providers, pid) {
+                Some(provider) => model_override.with_provider_defaults(&provider, pid),
                 None => model_override.with_missing_provider(),
             }
         });
@@ -3911,9 +3914,16 @@ pub struct ConfigModelOverride {
     pub api_key: Option<String>,
     /// Env var name(s) for the provider key: string or array in config.toml.
     pub env_key: Option<EnvKeys>,
+    /// How the credential is presented: `bearer` (default) or `x_api_key`.
+    /// Anthropic-style endpoints need `x_api_key`; setting it here keeps the key in the
+    /// environment instead of a plaintext `extra_headers` entry.
+    pub auth_scheme: Option<AuthScheme>,
     /// Name of a `[auth_provider.<name>]` credential helper that mints this model's bearer token.
     /// Static `api_key` / `env_key` win when both are set.
     pub auth_provider: Option<String>,
+    /// Id of a `[model_providers.<id>]` block or a built-in provider preset whose connection
+    /// defaults this model inherits. Spelled `provider` or `model_provider` in config.toml.
+    #[serde(alias = "provider")]
     pub model_provider: Option<String>,
     pub api_base_url: Option<String>,
     pub max_completion_tokens: Option<u32>,
@@ -4049,6 +4059,9 @@ impl ConfigModelOverride {
         }
         if self.stream_tool_calls.is_some() {
             entry.info.stream_tool_calls = self.stream_tool_calls;
+        }
+        if let Some(v) = self.auth_scheme {
+            entry.info.auth_scheme = v;
         }
         if self.api_key.is_some() {
             entry.api_key.clone_from(&self.api_key);

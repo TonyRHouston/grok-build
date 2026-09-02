@@ -351,6 +351,7 @@ User-level configuration lives in `$GROK_HOME/config.toml` (default `~/.grok/con
 | --- | --- | --- | --- | --- |
 | `model.<id>` | `table` | `yes` | `user` | Per-model override or BYOK definition. Prefer `env_key` over inline `api_key`. |
 | `model.<id>.agent_type` | `string` | `yes` | `user` | Agent definition type associated with this model. |
+| `model.<id>.auth_scheme` | `string` | `yes` | `user` | How the API key is sent: `bearer` (default) or `x_api_key`. Use `x_api_key` for Anthropic-style endpoints instead of putting the key in `extra_headers`. |
 | `model.<id>.api_backend` | `chat_completions / responses / messages` | `yes` | `user` | Wire protocol for this model. |
 | `model.<id>.api_base_url` | `string` | `yes` | `user` | Alternate API base used with XAI_API_KEY resolution. |
 | `model.<id>.api_key` | `string` | `yes` | `user` | Inline API key. Prefer `env_key`. Not a secret to put in a shared repo. |
@@ -370,7 +371,7 @@ User-level configuration lives in `$GROK_HOME/config.toml` (default `~/.grok/con
 | `model.<id>.max_retries` | `number` | `yes` | `user` | Inference retries for this model. |
 | `model.<id>.model` | `string` | `yes` | `user` | Model id sent to the API. |
 | `model.<id>.model_family` | `string` | `yes` | `user` | Family id used for compaction and capability grouping. |
-| `model.<id>.model_provider` | `string` | `yes` | `user` | Named `[model_providers.<name>]` provider id for this model. |
+| `model.<id>.model_provider` | `string` | `yes` | `user` | Provider id whose connection defaults this model inherits: a `[model_providers.<name>]` block or a built-in preset (`xai`, `openai`, `codex`, `anthropic`, `github-copilot`). Alias `provider`. |
 | `model.<id>.name` | `string` | `yes` | `user` | Label shown in the model picker. |
 | `model.<id>.query_params` | `map<string,string>` | `yes` | `user` | Extra query parameters on this model's requests. |
 | `model.<id>.reasoning_effort` | `string` | `yes` | `user` | Deprecated per-model effort; prefer `reasoning_efforts`. |
@@ -389,7 +390,21 @@ User-level configuration lives in `$GROK_HOME/config.toml` (default `~/.grok/con
 
 | Key | Type / Values | Requirements | Managed | Details |
 | --- | --- | --- | --- | --- |
-| `model_providers.<name>` | `table` | `yes` | `user` | Named custom model provider definition. |
+| `model_providers.<name>` | `table` | `yes` | `user` | Named model provider. When `<name>` matches a built-in preset (`xai`, `openai`, `codex`, `anthropic`, `github-copilot`) this block overrides that preset field by field; otherwise it defines a provider from scratch. |
+| `model_providers.<name>.api_backend` | `string` | `yes` | `user` | Wire protocol for this provider: `chat_completions`, `responses`, or `messages`. Inherited by its models. |
+| `model_providers.<name>.api_base_url` | `string` | `yes` | `user` | Base URL used for the models listing when it differs from `base_url`. |
+| `model_providers.<name>.api_key` | `string` | `yes` | `user` | Static API key. Prefer `env_key` so the secret stays out of the config file. |
+| `model_providers.<name>.auth` | `table` | `yes` | `user` | Inline credential-helper definition, same shape as `[auth_provider.<name>]`. |
+| `model_providers.<name>.auth_provider` | `string` | `yes` | `user` | Name of an `[auth_provider.<name>]` credential helper that mints this provider's token. |
+| `model_providers.<name>.auth_scheme` | `string` | `yes` | `user` | How the API key is sent: `bearer` (default) or `x_api_key`. Inherited by its models. |
+| `model_providers.<name>.base_url` | `string` | `yes` | `user` | Inference base URL. Inherited by its models. |
+| `model_providers.<name>.context_window` | `number` | `yes` | `user` | Default context window for this provider's models. |
+| `model_providers.<name>.env_http_headers` | `map<string,string>` | `yes` | `user` | HTTP headers populated from environment variables. Inherited by its models. |
+| `model_providers.<name>.env_key` | `string / string[]` | `yes` | `user` | Environment variable name(s) holding this provider's API key. Inherited by its models. |
+| `model_providers.<name>.extra_headers` | `map<string,string>` | `yes` | `user` | Headers sent on every request to this provider. Merged key by key with the preset's. |
+| `model_providers.<name>.query_params` | `map<string,string>` | `yes` | `user` | Query parameters folded into every request URL. Inherited by its models. |
+| `model_providers.<name>.stream_tool_calls` | `boolean` | `yes` | `user` | Default tool-call streaming request shape for this provider's models. |
+| `model_providers.<name>.supports_reasoning_effort` | `boolean` | `yes` | `user` | Whether this provider's models accept a reasoning-effort setting. |
 
 ### `models`
 

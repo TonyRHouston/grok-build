@@ -1,0 +1,70 @@
+{
+  "$comment": [
+    "Built-in provider presets. Edit this file to add a provider; no code change is needed.",
+    "Each entry supplies the defaults a `[model_providers.<id>]` block would otherwise have to",
+    "spell out by hand. A user's `[model_providers.<id>]` overrides these field by field, and a",
+    "`[model.<id>]` overrides the provider. Presets never carry a credential: they name the",
+    "environment variable(s) to read one from, so no secret is required in config.toml.",
+    "",
+    "`first_party` marks the xAI-operated provider. It does not by itself grant a session bearer:",
+    "credential routing is still gated by the URL predicates in `crate::util` and by each model's",
+    "own fail-closed auth-provider ref."
+  ],
+  "providers": [
+    {
+      "id": "xai",
+      "name": "xAI (Grok)",
+      "base_url": "https://api.x.ai/v1",
+      "api_backend": "responses",
+      "auth_scheme": "bearer",
+      "env_key": ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"],
+      "first_party": true
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "base_url": "https://api.openai.com/v1",
+      "api_backend": "chat_completions",
+      "auth_scheme": "bearer",
+      "env_key": ["OPENAI_API_KEY"],
+      "context_window": 128000
+    },
+    {
+      "id": "codex",
+      "name": "OpenAI (Responses)",
+      "base_url": "https://api.openai.com/v1",
+      "api_backend": "responses",
+      "auth_scheme": "bearer",
+      "env_key": ["OPENAI_API_KEY"],
+      "context_window": 272000,
+      "supports_reasoning_effort": true
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic (Claude)",
+      "base_url": "https://api.anthropic.com/v1",
+      "api_backend": "messages",
+      "auth_scheme": "x_api_key",
+      "env_key": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+      "extra_headers": {
+        "anthropic-version": "2023-06-01"
+      },
+      "context_window": 200000,
+      "supports_reasoning_effort": true
+    },
+    {
+      "id": "github-copilot",
+      "name": "GitHub Copilot",
+      "base_url": "https://api.githubcopilot.com",
+      "api_backend": "chat_completions",
+      "auth_scheme": "bearer",
+      "env_key": ["GITHUB_COPILOT_TOKEN", "GH_COPILOT_TOKEN"],
+      "extra_headers": {
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Version": "GrokBuild/1.0"
+      },
+      "context_window": 128000,
+      "stream_tool_calls": false
+    }
+  ]
+}

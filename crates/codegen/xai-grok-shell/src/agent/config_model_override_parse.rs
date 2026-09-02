@@ -346,7 +346,10 @@ fn parse_model_override_table(
 
 /// `(canonical, legacy)` key pairs that serde rejects as duplicate fields when both appear in one table.
 /// Keep in sync with the `#[serde(alias)]` attributes on [`ConfigModelOverride`].
-const ALIASES: &[(&str, &str)] = &[("compactions_remaining", "send_compactions_remaining")];
+const ALIASES: &[(&str, &str)] = &[
+    ("compactions_remaining", "send_compactions_remaining"),
+    ("model_provider", "provider"),
+];
 
 /// Removes one key of each [`ALIASES`] pair that appears twice in `table`.
 /// The canonical key wins; when its value doesn't parse, the legacy key is kept instead.
@@ -671,6 +674,7 @@ mod tests {
             description: Some("desc".into()),
             api_key: Some("key".into()),
             env_key: Some(crate::agent::config::EnvKeys::single("ENV_KEY")),
+            auth_scheme: Some(xai_grok_sampler::AuthScheme::XApiKey),
             auth_provider: Some("corp-gateway".into()),
             model_provider: Some("gateway".into()),
             api_base_url: Some("https://api.example.com".into()),
