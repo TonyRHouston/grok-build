@@ -35,6 +35,44 @@ impl xai_grok_sampler::BearerResolver for WireValidBearerResolver {
         self.0.current_wire_valid().map(|a| a.key)
     }
 }
+/// Sampler [`BearerResolver`](xai_grok_sampler::BearerResolver) over an
+/// [`AuthProviderRef`](crate::auth::AuthProviderRef): the per-request credential seam for
+/// models that authenticate through an auth provider (BYOK helpers, provider presets,
+/// short-lived exchanged tokens).
+///
+/// Each request reads the provider's cached token at send time instead of the `api_key`
+/// snapshot frozen into the config at session start, so a pre-turn or 401-recovery mint
+/// rotates the wire credential mid-session without a config rebuild. The read is cache-only
+/// (never blocks, never runs the helper); when the cache is cold the `fallback` snapshot —
+/// the key resolved when the config was built — keeps the request authenticated.
+///
+/// A fail-closed ref returns `None` from [`cached_token`](crate::auth::AuthProviderRef::cached_token)
+/// and is constructed with a `None` fallback, so no credential is stamped at all: exactly the
+/// fail-closed contract.
+pub(crate) struct ProviderBearerResolver {
+    provider: crate::auth::AuthProviderRef,
+    fallback: Option<String>,
+}
+impl ProviderBearerResolver {
+    pub(crate) fn shared(
+        provider: crate::auth::AuthProviderRef,
+        fallback: Option<String>,
+    ) -> xai_grok_sampler::SharedBearerResolver {
+        Arc::new(Self { provider, fallback })
+    }
+}
+impl std::fmt::Debug for ProviderBearerResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderBearerResolver").finish()
+    }
+}
+impl xai_grok_sampler::BearerResolver for ProviderBearerResolver {
+    fn current_bearer(&self) -> Option<String> {
+        self.provider
+            .cached_token()
+            .or_else(|| self.fallback.clone())
+    }
+}
 /// Production impl: wraps the live `AuthManager`.
 /// 401 recovery delegates to `AuthManager::unauthorized_recovery`.
 pub(crate) struct ShellAuthCredentialProvider {

@@ -645,15 +645,25 @@ fn session_bearer_resolver(
     })
 }
 /// [`session_bearer_resolver`] for an inherited config, where only the model string is known: BYOK comes from the catalog memo.
+/// A provider-authed model (auth-provider ref, e.g. a preset's builtin helper) instead gets a
+/// [`ProviderBearerResolver`](crate::auth::credential_provider::ProviderBearerResolver) over that
+/// ref, so a parent-side mint/rotation reaches the subagent's wire without a config rebuild.
 fn inherited_bearer_resolver(
     ctx: &SubagentSpawnContext,
     model: &str,
     base_url: &str,
+    fallback_key: Option<String>,
 ) -> Option<xai_grok_sampler::SharedBearerResolver> {
-    let byok = crate::agent::config::resolve_model_auth_facts_and_provider(model)
-        .0
-        .byok;
-    session_bearer_resolver(ctx, byok, base_url)
+    let (facts, provider) = crate::agent::config::resolve_model_auth_facts_and_provider(model);
+    if let Some(provider) = provider {
+        return Some(
+            crate::auth::credential_provider::ProviderBearerResolver::shared(
+                provider,
+                fallback_key,
+            ),
+        );
+    }
+    session_bearer_resolver(ctx, facts.byok, base_url)
 }
 fn parent_catalog_model_id(ctx: &SubagentSpawnContext, routing_model: &str) -> acp::ModelId {
     let models = ctx.models_manager.models();
@@ -693,6 +703,10 @@ async fn read_parent_sampling_config(
                 &cfg.api_backend,
                 &cfg.base_url,
             );
+            // Same first-party verdict the parent seams apply: identification headers and the
+            // identifiers themselves stay off third-party destinations.
+            let first_party_headers = crate::util::is_xai_api_url(&cfg.base_url);
+            let inherited_api_key = creds.api_key.clone();
             let inherited = xai_grok_sampler::SamplerConfig {
                 api_key: creds.api_key,
                 base_url: cfg.base_url,
@@ -707,21 +721,39 @@ async fn read_parent_sampling_config(
                 query_params: cfg.query_params.clone(),
                 env_http_headers: cfg.env_http_headers.clone(),
                 context_window: cfg.context_window.get(),
-                client_version: creds.client_version,
+                client_version: creds.client_version.filter(|_| first_party_headers),
                 reasoning_effort: cfg.reasoning_effort,
                 force_http1: false,
                 max_retries: None,
                 stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
                 idle_timeout_secs: None,
-                client_identifier: ctx.sampling_config.client_identifier.clone(),
-                deployment_id: ctx.sampling_config.deployment_id.clone(),
-                user_id: ctx.sampling_config.user_id.clone(),
+                client_identifier: ctx
+                    .sampling_config
+                    .client_identifier
+                    .clone()
+                    .filter(|_| first_party_headers),
+                deployment_id: ctx
+                    .sampling_config
+                    .deployment_id
+                    .clone()
+                    .filter(|_| first_party_headers),
+                user_id: ctx
+                    .sampling_config
+                    .user_id
+                    .clone()
+                    .filter(|_| first_party_headers),
+                first_party_headers,
                 origin_client: ctx.sampling_config.origin_client.clone(),
                 attribution_callback: ctx.attribution_callback.clone(),
                 bearer_resolver: if strip_guard {
                     None
                 } else {
-                    inherited_bearer_resolver(ctx, &cfg.model, &inherited_base_url)
+                    inherited_bearer_resolver(
+                        ctx,
+                        &cfg.model,
+                        &inherited_base_url,
+                        inherited_api_key,
+                    )
                 },
                 supports_backend_search,
                 compactions_remaining: ctx
@@ -769,7 +801,12 @@ async fn read_parent_sampling_config(
     fallback.bearer_resolver = if ctx.would_strip_fallback_key(fallback.api_key.as_deref()) {
         None
     } else {
-        inherited_bearer_resolver(ctx, &fallback.model, &fallback.base_url)
+        inherited_bearer_resolver(
+            ctx,
+            &fallback.model,
+            &fallback.base_url,
+            fallback.api_key.clone(),
+        )
     };
     let catalog_model_id = parent_catalog_model_id(ctx, &fallback.model);
     fallback.supports_backend_search = ctx
@@ -846,6 +883,16 @@ fn resolve_model_override_to_config(
                 crate::agent::auth_method::ModelByok::NotByok
             },
             &config.base_url,
+        )
+    } else if let Some(provider) = entry.auth_provider.clone() {
+        // Provider-authed model: read the provider's cached token per request so a mint or
+        // rotation reaches this subagent without a config rebuild (fail-closed refs resolve to
+        // no credential, same as the parent seam).
+        Some(
+            crate::auth::credential_provider::ProviderBearerResolver::shared(
+                provider,
+                config.api_key.clone(),
+            ),
         )
     } else {
         None

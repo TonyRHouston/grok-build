@@ -186,6 +186,7 @@ fn test_config(base_url: &str) -> SamplerConfig {
         reasoning_effort: None,
         deployment_id: None,
         user_id: None,
+        first_party_headers: true,
         origin_client: None,
         attribution_callback: None,
         bearer_resolver: None,

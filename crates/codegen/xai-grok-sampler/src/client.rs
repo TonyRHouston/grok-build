@@ -50,7 +50,10 @@ const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
+/// `enabled` mirrors [`crate::SamplerConfig::first_party_headers`]: when `false` (a third-party
+/// destination) `apply` attaches nothing, so no first-party identifier leaves the first party.
 struct GrokRequestHeaders<'a> {
+    enabled: bool,
     conv_id: &'a str,
     req_id: &'a str,
     model_id: &'a str,
@@ -65,6 +68,9 @@ struct GrokRequestHeaders<'a> {
 
 impl GrokRequestHeaders<'_> {
     fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if !self.enabled {
+            return builder;
+        }
         let mut b = builder
             .header("x-grok-conv-id", self.conv_id)
             .header("x-grok-req-id", self.req_id)
@@ -347,6 +353,8 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    /// See [`crate::SamplerConfig::first_party_headers`]; gates [`GrokRequestHeaders`].
+    first_party_headers: bool,
 }
 
 /// Endpoint URL builder, resolved once at client construction so each request only appends its path.
@@ -558,31 +566,33 @@ impl SamplingClient {
         );
 
         // Add x-grok-client-version header for version gating at the proxy.
-        if let Some(client_version) = config.client_version.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(client_version)
-        {
-            headers.insert(
-                HeaderName::from_static("x-grok-client-version"),
-                header_value,
-            );
-        }
+        // Like the identifiers below, it is a first-party protocol extension: a third-party
+        // destination gets none of them (`first_party_headers` is the shell's URL-trust verdict).
+        if config.first_party_headers {
+            if let Some(client_version) = config.client_version.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(client_version)
+            {
+                headers.insert(
+                    HeaderName::from_static("x-grok-client-version"),
+                    header_value,
+                );
+            }
 
-        if let Some(deployment_id) = config.deployment_id.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(deployment_id)
-        {
-            headers.insert(
-                HeaderName::from_static("x-grok-deployment-id"),
-                header_value,
-            );
-        }
+            if let Some(deployment_id) = config.deployment_id.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(deployment_id)
+            {
+                headers.insert(
+                    HeaderName::from_static("x-grok-deployment-id"),
+                    header_value,
+                );
+            }
 
-        if let Some(user_id) = config.user_id.as_ref()
-            && let Ok(header_value) = HeaderValue::from_str(user_id)
-        {
-            headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
-        }
+            if let Some(user_id) = config.user_id.as_ref()
+                && let Ok(header_value) = HeaderValue::from_str(user_id)
+            {
+                headers.insert(HeaderName::from_static("x-grok-user-id"), header_value);
+            }
 
-        {
             let client_id = config
                 .client_identifier
                 .clone()
@@ -641,6 +651,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
+            first_party_headers: config.first_party_headers,
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
@@ -903,6 +914,7 @@ impl SamplingClient {
         );
 
         let grok_headers = GrokRequestHeaders {
+            enabled: self.defaults.first_party_headers,
             conv_id: x_grok_conv_id,
             req_id: x_grok_req_id,
             model_id: &model_id,
@@ -990,6 +1002,7 @@ impl SamplingClient {
         };
 
         let grok_headers = GrokRequestHeaders {
+            enabled: self.defaults.first_party_headers,
             conv_id: x_grok_conv_id,
             req_id: x_grok_req_id,
             model_id: &model_id,
@@ -1192,6 +1205,7 @@ impl SamplingClient {
         tracing::debug!("endpoint: {:?}", self.endpoint("responses"));
 
         let grok_headers = GrokRequestHeaders {
+            enabled: self.defaults.first_party_headers,
             conv_id: x_grok_conv_id,
             req_id: x_grok_req_id,
             model_id: &model_id,
@@ -1329,6 +1343,7 @@ impl SamplingClient {
         );
 
         let grok_headers = GrokRequestHeaders {
+            enabled: self.defaults.first_party_headers,
             conv_id: x_grok_conv_id,
             req_id: x_grok_req_id,
             model_id: &model_id,
@@ -1550,6 +1565,7 @@ impl SamplingClient {
         tracing::debug!("endpoint: {:?}", self.endpoint("messages"));
 
         let grok_headers = GrokRequestHeaders {
+            enabled: self.defaults.first_party_headers,
             conv_id: x_grok_conv_id,
             req_id: x_grok_req_id,
             model_id: &model_id,
@@ -1672,6 +1688,7 @@ impl SamplingClient {
         );
 
         let grok_headers = GrokRequestHeaders {
+            enabled: self.defaults.first_party_headers,
             conv_id: x_grok_conv_id,
             req_id: x_grok_req_id,
             model_id: &model_id,
@@ -2228,6 +2245,7 @@ mod tests {
             deployment_id: None,
             user_id: None,
             client_version: None,
+            first_party_headers: false,
             attribution_callback: None,
             bearer_resolver: None,
             supports_backend_search: false,

@@ -70,6 +70,12 @@ pub struct ProviderProfile {
     /// Capability default: whether models from this vendor accept a reasoning-effort setting.
     #[serde(default)]
     pub supports_reasoning_effort: Option<bool>,
+    /// Compiled-in credential helper (`builtin:<mechanism>`) models inherit when the user
+    /// configured no credential of their own; the preset names a *mechanism*, never a secret.
+    /// E.g. the GitHub Copilot preset exchanges a durable GitHub token for the short-lived
+    /// Copilot bearer.
+    #[serde(default)]
+    pub auth_helper: Option<String>,
     /// True only for the xAI-operated provider.
     #[serde(default)]
     pub first_party: bool,
@@ -120,7 +126,9 @@ impl ProviderProfile {
             extra_headers: self.extra_headers.clone(),
             query_params: self.query_params.clone(),
             env_http_headers: self.env_http_headers.clone(),
-            auth_provider: None,
+            // The helper is a fallback behind env_key: `resolve_credentials` tries the model's
+            // own credential (env/api_key) before the provider mint, so an env var always wins.
+            auth_provider: self.auth_helper.clone(),
             auth: None,
             context_window: self.context_window,
             stream_tool_calls: self.stream_tool_calls,
@@ -154,6 +162,41 @@ pub(crate) fn provider_is_known(
     id: &str,
 ) -> bool {
     user_providers.contains_key(id) || declared.contains(id) || builtin_profile(id).is_some()
+}
+
+/// The registrable domain (last two labels) of a URL's host, lowercased.
+fn registrable_domain(host: &str) -> Option<String> {
+    let mut labels = host.rsplit('.');
+    let tld = labels.next().filter(|l| !l.is_empty())?;
+    let second = labels.next().filter(|l| !l.is_empty())?;
+    Some(format!("{second}.{tld}").to_ascii_lowercase())
+}
+
+/// True when `url` routes to a host owned by a known third-party vendor — the registrable domain
+/// of any non-first-party preset's base URL (e.g. `openai.com`, `anthropic.com`,
+/// `githubcopilot.com`), including subdomains such as regional endpoints.
+///
+/// This is the structural deny behind session isolation: `resolve_credentials` refuses to attach a
+/// first-party credential (session bearer or `XAI_API_KEY`) to these hosts *under any
+/// configuration*, even for a hand-written `[model.<id>]` with no `model_provider` tag. Presets
+/// are data, so the deny set updates with `default_providers.json`. Unparseable URLs are not
+/// vendor hosts; the scheme is ignored so the deny also covers plain-HTTP variants.
+pub(crate) fn is_third_party_vendor_url(url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    builtin_profiles()
+        .filter(|p| !p.first_party)
+        .filter_map(|p| p.base_url.as_deref())
+        .filter_map(|base| {
+            reqwest::Url::parse(base)
+                .ok()
+                .and_then(|u| u.host_str().and_then(registrable_domain))
+        })
+        .any(|vendor| host == vendor || host.ends_with(&format!(".{vendor}")))
 }
 
 #[cfg(test)]

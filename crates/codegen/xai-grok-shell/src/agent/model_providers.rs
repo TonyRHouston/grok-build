@@ -52,10 +52,18 @@ impl ModelProviderConfig {
         merged.supports_reasoning_effort = merged
             .supports_reasoning_effort
             .or(profile.supports_reasoning_effort);
-        // A user credential of any kind suppresses the preset's env_key, so an explicit choice is
-        // never silently widened to another variable.
-        if merged.api_key.is_none() && merged.env_key.is_none() && merged.auth_provider.is_none() {
+        // A user credential of any kind (key, env var, provider ref, or inline auth) suppresses
+        // the preset's env_key and auth_helper, so an explicit choice is never silently widened
+        // to another variable or a builtin mint.
+        if merged.api_key.is_none()
+            && merged.env_key.is_none()
+            && merged.auth_provider.is_none()
+            && merged.auth.is_none()
+        {
             merged.env_key = profile.env_key.clone();
+            // Behind env_key at resolve time: the model's own env credential is tried before
+            // the provider mint, so setting the env var always wins over the helper.
+            merged.auth_provider = profile.auth_helper.clone();
         }
         merge_defaults(&mut merged.extra_headers, &profile.extra_headers);
         merge_defaults(&mut merged.query_params, &profile.query_params);
