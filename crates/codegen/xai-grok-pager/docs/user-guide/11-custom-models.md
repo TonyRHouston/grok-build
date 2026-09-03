@@ -203,11 +203,71 @@ When you override a built-in model, Grok starts with the default configuration (
 
 ---
 
+## Built-in Providers
+
+Grok ships presets for the common vendors, so a model entry only needs a model id and a provider:
+
+```toml
+[model.claude]
+model = "claude-sonnet-4"
+provider = "anthropic"
+```
+
+That is the whole configuration. The preset supplies the base URL, the wire protocol
+(`api_backend`), the authentication scheme, the required vendor headers, and the context window.
+Your key is read from the environment (`ANTHROPIC_API_KEY` here), so **no secret is written to
+`config.toml`**.
+
+| Provider id | Vendor | `api_backend` | Auth scheme | Key read from |
+| --- | --- | --- | --- | --- |
+| `xai` | xAI | `responses` | `Authorization: Bearer` | `XAI_API_KEY`, `GROK_CODE_XAI_API_KEY` |
+| `openai` | OpenAI | `chat_completions` | `Authorization: Bearer` | `OPENAI_API_KEY` |
+| `codex` | OpenAI Responses API | `responses` | `Authorization: Bearer` | `OPENAI_API_KEY` |
+| `anthropic` | Anthropic (Claude) | `messages` | `x-api-key` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` |
+| `github-copilot` | GitHub Copilot | `chat_completions` | `Authorization: Bearer` | `GITHUB_COPILOT_TOKEN`, `GH_COPILOT_TOKEN` |
+
+`provider` is a shorter spelling of `model_provider`; both name the same field, and setting both is
+an error.
+
+> **GitHub Copilot** needs a short-lived bearer that is exchanged from a GitHub token and expires
+> after minutes. The preset describes the endpoint, but Grok cannot yet mint or refresh that token
+> for you — set `GITHUB_COPILOT_TOKEN` yourself and expect to refresh it.
+
+### Overriding a preset
+
+A `[model_providers.<id>]` block whose id matches a preset **layers onto** it rather than replacing
+it. Point Claude at a corporate gateway without restating the protocol or its headers:
+
+```toml
+[model_providers.anthropic]
+base_url = "https://gateway.corp.example/anthropic"
+
+[model.claude]
+model = "claude-sonnet-4"
+provider = "anthropic"
+```
+
+Fields you set win; fields you leave out come from the preset. Headers and query parameters merge
+key by key, so adding one header does not drop the vendor's required ones.
+
+Any id that is *not* a preset defines a provider from scratch, exactly as before.
+
+---
+
 ## Provider Examples
 
 ### Anthropic (Claude)
 
-Use Claude models directly via the Anthropic Messages API:
+Use the built-in preset and keep your key in the environment:
+
+```toml
+[model.claude-opus]
+model = "claude-opus-4-6"
+provider = "anthropic"
+name = "Claude Opus 4.6"
+```
+
+To reach an Anthropic-compatible endpoint that has no preset, state the shape yourself:
 
 ```toml
 [model.claude-opus]
@@ -215,36 +275,40 @@ model = "claude-opus-4-6"
 base_url = "https://api.anthropic.com/v1"
 name = "Claude Opus 4.6"
 api_backend = "messages"
+auth_scheme = "x_api_key"
+env_key = "ANTHROPIC_API_KEY"
 context_window = 200000
-extra_headers = { "x-api-key" = "sk-ant-...", "anthropic-version" = "2023-06-01" }
+extra_headers = { "anthropic-version" = "2023-06-01" }
 ```
 
-The `messages` backend uses the Anthropic Messages protocol. Anthropic authenticates with an `x-api-key` header rather than `Authorization: Bearer`, so pass your key through `extra_headers`, which Grok sends verbatim.
+The `messages` backend uses the Anthropic Messages protocol. Anthropic authenticates with an
+`x-api-key` header rather than `Authorization: Bearer`; `auth_scheme = "x_api_key"` sends the
+resolved key under that header. Do **not** put the key in `extra_headers` — that persists it in
+plaintext in your config file and in session state.
 
 ### OpenAI (Chat Completions)
 
 ```toml
 [model.gpt-4o]
 model = "gpt-4o"
-base_url = "https://api.openai.com/v1"
+provider = "openai"
 name = "GPT-4o"
-env_key = "OPENAI_API_KEY"
 ```
 
 `api_backend` defaults to `"chat_completions"`, so you don't need to set it explicitly for OpenAI.
 
-### OpenAI (Responses API)
+### OpenAI (Responses API) / Codex
 
 If your provider supports the newer Responses API:
 
 ```toml
-[model.gpt-4o-responses]
-model = "gpt-4o"
-base_url = "https://api.openai.com/v1"
-name = "GPT-4o (Responses)"
-api_backend = "responses"
-env_key = "OPENAI_API_KEY"
+[model.gpt-5-codex]
+model = "gpt-5-codex"
+provider = "codex"
+name = "Codex"
 ```
+
+The `codex` preset is the same endpoint as `openai` with `api_backend = "responses"`.
 
 ### Ollama (Local Models)
 

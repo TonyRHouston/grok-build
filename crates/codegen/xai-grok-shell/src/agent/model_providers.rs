@@ -2,8 +2,16 @@ use indexmap::IndexMap;
 
 use super::config::{ConfigModelOverride, EnvKeys};
 use super::config_model_override_parse::{ConfigWarning, ConfigWarningKind};
+use super::provider_profiles::ProviderProfile;
 use crate::sampling::ApiBackend;
+use xai_grok_sampler::AuthScheme;
 
+/// A user's `[model_providers.<id>]` block.
+///
+/// This is an *override of* a built-in [`ProviderProfile`], not the whole definition: any field
+/// left unset falls back to the preset for the same id (see
+/// [`resolve_provider`](super::provider_profiles::resolve_provider)). A block with no fields at
+/// all therefore still yields a working provider when its id names a preset.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct ModelProviderConfig {
@@ -12,6 +20,9 @@ pub struct ModelProviderConfig {
     pub env_key: Option<EnvKeys>,
     pub api_key: Option<String>,
     pub api_backend: Option<ApiBackend>,
+    /// How the credential is presented: `bearer` (default) or `x_api_key`.
+    /// Inherited by models, so an Anthropic key never has to be pasted into `extra_headers`.
+    pub auth_scheme: Option<AuthScheme>,
     pub extra_headers: IndexMap<String, String>,
     /// Query parameters folded into every request URL; inherited by models.
     pub query_params: IndexMap<String, String>,
@@ -20,10 +31,129 @@ pub struct ModelProviderConfig {
     pub auth_provider: Option<String>,
     pub auth: Option<crate::auth::AuthProviderConfig>,
     pub context_window: Option<u64>,
+    /// Capability default inherited by models; see [`ProviderProfile::stream_tool_calls`].
+    pub stream_tool_calls: Option<bool>,
+    /// Capability default inherited by models.
+    pub supports_reasoning_effort: Option<bool>,
+}
+
+impl ModelProviderConfig {
+    /// Fill every unset field from the built-in preset. The user's block always wins.
+    ///
+    /// Maps are merged per key rather than wholesale so a user adding one header does not silently
+    /// drop a preset header the vendor requires (e.g. `anthropic-version`).
+    pub(crate) fn with_profile_defaults(&self, profile: &ProviderProfile) -> Self {
+        let mut merged = self.clone();
+        merged.base_url = merged.base_url.or_else(|| profile.base_url.clone());
+        merged.api_backend = merged.api_backend.or_else(|| profile.api_backend.clone());
+        merged.auth_scheme = merged.auth_scheme.or(profile.auth_scheme);
+        merged.context_window = merged.context_window.or(profile.context_window);
+        merged.stream_tool_calls = merged.stream_tool_calls.or(profile.stream_tool_calls);
+        merged.supports_reasoning_effort = merged
+            .supports_reasoning_effort
+            .or(profile.supports_reasoning_effort);
+        // A user credential of any kind suppresses the preset's env_key, so an explicit choice is
+        // never silently widened to another variable.
+        if merged.api_key.is_none() && merged.env_key.is_none() && merged.auth_provider.is_none() {
+            merged.env_key = profile.env_key.clone();
+        }
+        merge_defaults(&mut merged.extra_headers, &profile.extra_headers);
+        merge_defaults(&mut merged.query_params, &profile.query_params);
+        merge_defaults(&mut merged.env_http_headers, &profile.env_http_headers);
+        merged
+    }
+}
+
+/// Insert every `defaults` entry the caller has not already set. Keys are compared
+/// case-insensitively so `Anthropic-Version` does not duplicate `anthropic-version`.
+fn merge_defaults(target: &mut IndexMap<String, String>, defaults: &IndexMap<String, String>) {
+    for (key, value) in defaults {
+        if !target
+            .keys()
+            .any(|existing| existing.eq_ignore_ascii_case(key))
+        {
+            target.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 pub(crate) fn model_provider_auth_name(provider_id: &str) -> String {
     format!("model_provider:{provider_id}")
+}
+
+/// Wire-shape mismatches that produce a confusing 4xx rather than an obvious config error.
+///
+/// The checks are deliberately narrow: they only fire when the *effective* provider (preset
+/// defaults already folded in) contradicts itself, so a deliberate gateway setup that proxies one
+/// vendor's dialect over another host is never flagged.
+pub(crate) fn wire_shape_issues(
+    config: &ModelProviderConfig,
+) -> Vec<(&'static str, ConfigWarningKind, String)> {
+    let mut issues = Vec::new();
+    let host = config
+        .base_url
+        .as_deref()
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .and_then(|url| url.host_str().map(str::to_owned));
+    let host_is = |suffix: &str| {
+        host.as_deref()
+            .is_some_and(|h| h == suffix || h.ends_with(&format!(".{suffix}")))
+    };
+
+    if host_is("anthropic.com") {
+        if config
+            .api_backend
+            .as_ref()
+            .is_some_and(|b| *b != ApiBackend::Messages)
+        {
+            issues.push((
+                "api_backend",
+                ConfigWarningKind::InvalidValue,
+                "api.anthropic.com speaks the Messages API; set api_backend = \"messages\" \
+                 (the built-in `anthropic` provider already does)"
+                    .to_owned(),
+            ));
+        }
+        if config.auth_scheme == Some(AuthScheme::Bearer) {
+            issues.push((
+                "auth_scheme",
+                ConfigWarningKind::InvalidValue,
+                "api.anthropic.com authenticates with the x-api-key header, not \
+                 Authorization: Bearer; set auth_scheme = \"x_api_key\""
+                    .to_owned(),
+            ));
+        }
+        if !config
+            .extra_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("anthropic-version"))
+        {
+            issues.push((
+                "extra_headers",
+                ConfigWarningKind::InvalidValue,
+                "api.anthropic.com requires an anthropic-version header; inherit the built-in \
+                 `anthropic` provider or set it here"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    // A credential pasted into a header is persisted to disk and into session state; the
+    // auth_scheme field exists precisely so it does not have to be.
+    for key in config.extra_headers.keys() {
+        if key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("x-api-key") {
+            issues.push((
+                "extra_headers",
+                ConfigWarningKind::InvalidValue,
+                format!(
+                    "`{key}` carries a credential in plaintext config; use env_key together with \
+                     auth_scheme instead so the secret stays in the environment"
+                ),
+            ));
+            break;
+        }
+    }
+    issues
 }
 
 pub(crate) fn auth_config_issues(
@@ -107,6 +237,15 @@ pub(crate) fn parse_model_providers(
                         ));
                     }
                 }
+                // Validate the *effective* provider so a preset that already supplies the missing
+                // piece (e.g. `anthropic-version`) does not produce a spurious warning.
+                let effective = match super::provider_profiles::builtin_profile(id) {
+                    Some(profile) => provider.with_profile_defaults(profile),
+                    None => provider.clone(),
+                };
+                for (field, kind, reason) in wire_shape_issues(&effective) {
+                    warnings.push(ConfigWarning::model_provider(id, Some(field), kind, reason));
+                }
                 let has_helper = provider.auth.is_some() || provider.auth_provider.is_some();
                 let has_static_api_key = provider
                     .api_key
@@ -178,12 +317,15 @@ impl ConfigModelOverride {
             env_key,
             api_key,
             api_backend,
+            auth_scheme,
             extra_headers,
             query_params,
             env_http_headers,
             auth_provider,
             auth,
             context_window,
+            stream_tool_calls,
+            supports_reasoning_effort,
         } = provider;
 
         let mut merged = self.clone();
@@ -191,7 +333,12 @@ impl ConfigModelOverride {
         merged.base_url = merged.base_url.or_else(|| base_url.clone());
         merged.api_base_url = merged.api_base_url.or_else(|| api_base_url.clone());
         merged.api_backend = merged.api_backend.or_else(|| api_backend.clone());
+        merged.auth_scheme = merged.auth_scheme.or(*auth_scheme);
         merged.context_window = merged.context_window.or(*context_window);
+        merged.stream_tool_calls = merged.stream_tool_calls.or(*stream_tool_calls);
+        merged.supports_reasoning_effort = merged
+            .supports_reasoning_effort
+            .or(*supports_reasoning_effort);
         // Inherited wholesale only when the model sets none of its own.
         if merged.extra_headers.is_empty() {
             merged.extra_headers = extra_headers.clone();
@@ -228,7 +375,9 @@ impl ConfigModelOverride {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::config::{Config, resolve_credentials, resolve_model_list};
+    use crate::agent::config::{Config, EnvKeys, resolve_credentials, resolve_model_list};
+    use crate::sampling::ApiBackend;
+    use xai_grok_sampler::AuthScheme;
     #[test]
     fn model_inherits_provider_connection_defaults() {
         let raw_config: toml::Value = toml::from_str(
@@ -1005,5 +1154,290 @@ mod tests {
             Some("model"),
             "a model that sets its own query params inherits none of the provider's"
         );
+    }
+
+    // --- Built-in provider presets -------------------------------------------------------------
+    // These lock in the "easily runs off of Codex/Claude/Copilot" contract: the number of TOML keys
+    // a user must write, and — more importantly — that no credential ever has to be one of them.
+
+    /// The headline goal: two keys reach Claude, with the key read from the environment.
+    #[test]
+    fn claude_needs_only_a_model_and_a_provider_id() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.claude]
+            model = "claude-sonnet-4"
+            provider = "anthropic"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        assert_eq!(
+            cfg.config_warnings,
+            Vec::new(),
+            "a built-in provider id must not warn as undefined"
+        );
+
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("claude").expect("model should exist");
+        assert_eq!(model.info.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(model.info.api_backend, ApiBackend::Messages);
+        assert_eq!(model.info.auth_scheme, AuthScheme::XApiKey);
+        assert_eq!(model.info.context_window.get(), 200_000);
+        assert_eq!(
+            model
+                .info
+                .extra_headers
+                .get("anthropic-version")
+                .map(String::as_str),
+            Some("2023-06-01"),
+            "the version header must come from the preset, not from the user"
+        );
+        assert_eq!(
+            model.env_key.as_ref().and_then(EnvKeys::primary),
+            Some("ANTHROPIC_API_KEY")
+        );
+        assert!(
+            model.api_key.is_none(),
+            "a preset must never materialize a static key"
+        );
+    }
+
+    #[test]
+    fn codex_preset_selects_the_responses_backend() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.codex]
+            model = "gpt-5-codex"
+            provider = "codex"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("codex").expect("model should exist");
+        assert_eq!(model.info.base_url, "https://api.openai.com/v1");
+        assert_eq!(model.info.api_backend, ApiBackend::Responses);
+        assert_eq!(model.info.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(
+            model.env_key.as_ref().and_then(EnvKeys::primary),
+            Some("OPENAI_API_KEY")
+        );
+    }
+
+    /// Copilot rejects the streaming tool-call field, so the preset — not the user — turns it off.
+    #[test]
+    fn copilot_preset_supplies_capability_defaults() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.copilot]
+            model = "gpt-4o"
+            provider = "github-copilot"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("copilot").expect("model should exist");
+        assert_eq!(model.info.stream_tool_calls, Some(false));
+        assert!(
+            model
+                .info
+                .extra_headers
+                .contains_key("Copilot-Integration-Id"),
+            "editor identification belongs on the profile, not in user config"
+        );
+    }
+
+    /// A user block layers *onto* the preset instead of replacing it, so overriding the base URL
+    /// (a corporate gateway) does not silently drop the vendor's required headers.
+    #[test]
+    fn user_provider_block_overrides_preset_without_dropping_required_headers() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model_providers.anthropic]
+            base_url = "https://gateway.corp.example/anthropic"
+
+            [model.claude]
+            model = "claude-sonnet-4"
+            provider = "anthropic"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("claude").expect("model should exist");
+        assert_eq!(
+            model.info.base_url,
+            "https://gateway.corp.example/anthropic"
+        );
+        assert_eq!(model.info.api_backend, ApiBackend::Messages);
+        assert_eq!(
+            model
+                .info
+                .extra_headers
+                .get("anthropic-version")
+                .map(String::as_str),
+            Some("2023-06-01")
+        );
+    }
+
+    /// `provider` is a spelling of `model_provider`, not a second field.
+    #[test]
+    fn provider_alias_matches_model_provider() {
+        let with_alias: toml::Value =
+            toml::from_str("[model.m]\nmodel = \"m\"\nprovider = \"anthropic\"\n").unwrap();
+        let canonical: toml::Value =
+            toml::from_str("[model.m]\nmodel = \"m\"\nmodel_provider = \"anthropic\"\n").unwrap();
+        let a = Config::new_from_toml_cfg(&with_alias).expect("config should parse");
+        let b = Config::new_from_toml_cfg(&canonical).expect("config should parse");
+        assert_eq!(
+            resolve_model_list(&a, None)["m"].info.base_url,
+            resolve_model_list(&b, None)["m"].info.base_url
+        );
+    }
+
+    /// A typo must still be reported, or a fail-closed model looks like a working one.
+    #[test]
+    fn unknown_provider_id_still_warns() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.m]
+            model = "m"
+            provider = "anthropik"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        assert!(
+            cfg.config_warnings
+                .iter()
+                .any(|w| w.reason.contains("anthropik")),
+            "a misspelled provider must warn: {:?}",
+            cfg.config_warnings
+        );
+    }
+
+    // --- Security invariants --------------------------------------------------------------------
+
+    /// Presets widen *where* requests go, so they must not widen *what* is sent. A third-party
+    /// model with no credential of its own must fail closed rather than fall through to the
+    /// first-party session token or `XAI_API_KEY`.
+    #[test]
+    fn preset_model_never_receives_the_session_token() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.claude]
+            model = "claude-sonnet-4"
+            provider = "anthropic"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let model = resolved.get("claude").expect("model should exist");
+        let auth_provider = model
+            .auth_provider
+            .as_ref()
+            .expect("a third-party endpoint must carry the fail-closed guard");
+        assert!(
+            auth_provider.is_fail_closed(),
+            "third-party providers must fail closed on the credential seam"
+        );
+
+        // ANTHROPIC_API_KEY is unset in tests, so there is no own credential to find.
+        let creds = resolve_credentials(model, Some("session-token-value"));
+        assert_eq!(
+            creds.api_key, None,
+            "the session bearer must never reach a third-party host"
+        );
+        assert_eq!(creds.auth_scheme, AuthScheme::XApiKey);
+    }
+
+    /// Every non-first-party preset host must fail the credential-attachment predicate, which is
+    /// what drives the fail-closed guard above. Plain HTTP must fail it too.
+    #[test]
+    fn no_third_party_preset_host_can_receive_a_first_party_bearer() {
+        for profile in crate::agent::provider_profiles::builtin_profiles() {
+            let Some(base_url) = profile.base_url.as_deref() else {
+                continue;
+            };
+            assert_eq!(
+                crate::util::is_xai_api_bearer_url(base_url),
+                profile.first_party,
+                "only the first-party provider's host may be handed a first-party bearer ({})",
+                profile.id
+            );
+            let insecure = base_url.replace("https://", "http://");
+            assert!(
+                !crate::util::is_xai_api_bearer_url(&insecure),
+                "plain HTTP must never receive a bearer ({})",
+                profile.id
+            );
+        }
+    }
+
+    /// The whole point of exposing `auth_scheme`: an Anthropic key no longer has to be pasted into
+    /// `extra_headers`, where it would be persisted to disk and into session state.
+    #[test]
+    fn credential_headers_in_config_are_flagged() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model_providers.byok]
+            base_url = "https://api.example.com/v1"
+
+            [model_providers.byok.extra_headers]
+            x-api-key = "sk-ant-secret"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        assert!(
+            cfg.config_warnings
+                .iter()
+                .any(|w| w.reason.contains("plaintext config")),
+            "a credential header must be flagged: {:?}",
+            cfg.config_warnings
+        );
+    }
+
+    /// Contradicting a vendor's wire shape yields a 4xx that is hard to read; say so up front.
+    #[test]
+    fn anthropic_wire_shape_mismatches_are_flagged() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model_providers.anthropic]
+            api_backend = "chat_completions"
+            auth_scheme = "bearer"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let reasons: Vec<&str> = cfg
+            .config_warnings
+            .iter()
+            .map(|w| w.reason.as_str())
+            .collect();
+        assert!(
+            reasons.iter().any(|r| r.contains("Messages API")),
+            "backend mismatch must warn: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|r| r.contains("x-api-key header")),
+            "auth scheme mismatch must warn: {reasons:?}"
+        );
+    }
+
+    /// The presets themselves must be self-consistent, or every user inherits the mistake.
+    #[test]
+    fn every_preset_is_free_of_wire_shape_issues() {
+        for profile in crate::agent::provider_profiles::builtin_profiles() {
+            let issues = super::wire_shape_issues(&profile.to_provider_config());
+            assert!(
+                issues.is_empty(),
+                "preset '{}' contradicts itself: {issues:?}",
+                profile.id
+            );
+        }
     }
 }
