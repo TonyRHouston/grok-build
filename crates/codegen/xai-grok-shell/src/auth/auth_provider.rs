@@ -26,11 +26,16 @@ pub struct AuthProviderConfig {
     pub timeout_secs: Option<u64>,
     /// Working directory for the command; a leading `~` expands to home.
     pub cwd: Option<String>,
+    /// Compiled-in credential mechanism (see [`super::builtin_helpers`]); never user-set
+    /// (`serde(skip)` keeps it out of TOML — a user table key `builtin` draws the standard
+    /// unknown-field warning). When set and `command` is empty, the mint runs in-process.
+    #[serde(skip)]
+    pub builtin: Option<String>,
 }
 
 impl AuthProviderConfig {
     pub(crate) fn is_usable(&self) -> bool {
-        !self.command.trim().is_empty()
+        !self.command.trim().is_empty() || self.builtin.is_some()
     }
 }
 
@@ -192,15 +197,28 @@ const PROVIDER_STDERR_CAP_BYTES: u64 = 64 << 10; // 64 KiB
 /// Token-shaping fields go here; an execution knob like `timeout_secs` never invalidates the cache.
 fn token_identity(
     config: &AuthProviderConfig,
-) -> (&str, Option<&[String]>, Option<u64>, Option<&str>) {
+) -> (
+    &str,
+    Option<&[String]>,
+    Option<u64>,
+    Option<&str>,
+    Option<&str>,
+) {
     let AuthProviderConfig {
         command,
         args,
         token_ttl_secs,
         timeout_secs: _,
         cwd,
+        builtin,
     } = config;
-    (command, args.as_deref(), *token_ttl_secs, cwd.as_deref())
+    (
+        command,
+        args.as_deref(),
+        *token_ttl_secs,
+        cwd.as_deref(),
+        builtin.as_deref(),
+    )
 }
 
 fn minted_token_is_stale(minted: &MintedProviderToken, config: &AuthProviderConfig) -> bool {
@@ -333,6 +351,36 @@ async fn mint_provider_token(
 
     let name = &provider.name;
     let config = &provider.config;
+    // A compiled-in mechanism mints in-process; a user table with a command shadows it
+    // (`builtin` is never set alongside a command by the registry, and user TOML can't set it).
+    if config.command.trim().is_empty()
+        && let Some(mechanism) = config.builtin.as_deref()
+    {
+        tracing::info!(
+            provider = %name,
+            mechanism,
+            mark_expired,
+            "auth provider: running builtin credential helper"
+        );
+        let parsed = super::builtin_helpers::mint(mechanism).await?;
+        let expires_at = parsed
+            .expires_at
+            .or_else(|| config.token_ttl_secs.and_then(expiry_after_seconds))
+            .or_else(|| crate::auth::parse_jwt_expiration(&parsed.access_token));
+        tracing::info!(
+            provider = %name,
+            mechanism,
+            expires_at = ?expires_at,
+            "auth provider minted token (builtin)"
+        );
+        return Ok(MintedProviderToken {
+            token: parsed.access_token,
+            refresh_token: parsed.refresh_token,
+            minted_at: std::time::Instant::now(),
+            expires_at,
+            minted_with: config.clone(),
+        });
+    }
     // Clamp to [1, ceiling]: the slot lock is held across the run
     // An unbounded timeout would let one hung helper stall every turn sharing this provider name
     // The ceiling is a hard bound, not just a parse warning

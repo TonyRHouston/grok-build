@@ -701,6 +701,11 @@ impl SessionActor {
             &cfg.api_backend,
             &cfg.base_url,
         );
+        // First-party verdict for the x-grok-* identification headers; the identifiers are also
+        // dropped from the config itself so nothing first-party rides along to a third party.
+        let first_party_headers = crate::util::is_xai_api_url(&cfg.base_url);
+        let model_for_provider = cfg.model.clone();
+        let api_key_snapshot = api_key.clone();
         SamplingConfig {
             api_key,
             base_url: cfg.base_url,
@@ -715,32 +720,46 @@ impl SessionActor {
             query_params: cfg.query_params.clone(),
             env_http_headers: cfg.env_http_headers.clone(),
             context_window: cfg.context_window.get(),
-            client_version: creds.client_version,
+            client_version: creds.client_version.filter(|_| first_party_headers),
             reasoning_effort: cfg.reasoning_effort,
             force_http1: false,
             max_retries: Some(self.max_retries),
             stream_tool_calls: cfg.stream_tool_calls.unwrap_or(false),
             idle_timeout_secs: None,
-            client_identifier: self.client_identifier.clone(),
+            client_identifier: self.client_identifier.clone().filter(|_| first_party_headers),
             deployment_id: crate::managed_config::resolve_deployment_id(
                 crate::managed_config::resolve_deployment_key().as_deref(),
-            ),
+            )
+            .filter(|_| first_party_headers),
             user_id: self
                 .auth_manager
                 .as_ref()
                 .and_then(|am| am.current_or_expired())
                 .filter(|a| a.is_xai_auth())
-                .map(|a| a.user_id),
+                .map(|a| a.user_id)
+                .filter(|_| first_party_headers),
+            first_party_headers,
             origin_client: self.origin_client.clone(),
             // Attribute sampler 401s against the bearer sent on the wire.
             // `None` for sessions spawned without an `AuthManager` (BYOK direct, certain test fixtures)
             attribution_callback: self.attribution_callback.clone(),
-            // Per-request bearer override is only valid for session-token auth.
-            // Explicit API-key/env-key models must keep their configured bearer and must not be overwritten by the interactive session token
+            // Per-request bearer override:
+            // - Session-token auth (first-party): the wire-valid session resolver.
+            // - Auth-provider-backed models (BYOK helpers, provider presets, exchanged tokens):
+            //   the provider resolver, so a pre-turn or 401-recovery mint rotates the wire
+            //   credential mid-session. Fallback is the snapshot key resolved above.
+            // - Explicit API-key/env-key models keep their configured bearer untouched.
             bearer_resolver: if use_bearer_resolver {
                 self.auth_manager.as_ref().map(|am| {
                     crate::auth::credential_provider::WireValidBearerResolver::shared(am.clone())
                 })
+            } else if let Some(provider) = self.model_auth_provider(model_for_provider.as_str()) {
+                Some(
+                    crate::auth::credential_provider::ProviderBearerResolver::shared(
+                        provider,
+                        api_key_snapshot,
+                    ),
+                )
             } else {
                 None
             },

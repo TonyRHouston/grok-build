@@ -91,6 +91,7 @@ mod tests {
             deployment_id: None,
             user_id: None,
             client_version: None,
+            first_party_headers: false,
             attribution_callback: None,
             bearer_resolver: None,
             supports_backend_search: false,

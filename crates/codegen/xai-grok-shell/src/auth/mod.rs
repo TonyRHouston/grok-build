@@ -2,6 +2,7 @@ pub(crate) mod api_key_probe;
 pub(crate) mod attribution;
 mod auth_provider;
 pub(crate) mod backend;
+pub(crate) mod builtin_helpers;
 mod config;
 pub mod credential_provider;
 #[path = "devbox_login_stub.rs"]

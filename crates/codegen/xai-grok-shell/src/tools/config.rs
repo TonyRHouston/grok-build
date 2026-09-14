@@ -209,6 +209,8 @@ impl ShellToolsetConfig {
             client_identifier: None,
             deployment_id: None,
             user_id: None,
+            // The placeholder routes at the first-party API, so it keeps first-party headers.
+            first_party_headers: true,
             origin_client: None,
             // Leaving the callback `None` here is fine; this base is only the placeholder for the "no base provided" path
             // Production `SamplerConfig`s in agent/config.rs and acp_session.rs set the real attribution callback

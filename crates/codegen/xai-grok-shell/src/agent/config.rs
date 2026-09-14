@@ -1850,6 +1850,16 @@ fn parse_auth_providers(
         return (providers, warnings);
     };
     for (name, value) in table {
+        if name.starts_with(crate::auth::builtin_helpers::BUILTIN_PROVIDER_PREFIX) {
+            warnings.push(ConfigWarning::auth_provider(
+                name,
+                None,
+                ConfigWarningKind::ConflictingFields,
+                "the `builtin:` prefix is a reserved namespace for compiled-in credential \
+                 helpers; this table shadows the builtin mechanism"
+                    .to_owned(),
+            ));
+        }
         let mut unknown = Vec::new();
         match serde_ignored::deserialize::<_, _, crate::auth::AuthProviderConfig>(
             value.clone(),
@@ -3509,7 +3519,11 @@ pub(crate) fn resolve_model_list(
             if provider.is_fail_closed() {
                 continue;
             }
-            let config = cfg.auth_providers.get(&provider.name);
+            // A user table wins over a compiled `builtin:*` mechanism (with a reserved-namespace
+            // warning at parse), so a broken builtin can be worked around locally.
+            let config = cfg.auth_providers.get(&provider.name).cloned().or_else(|| {
+                crate::auth::builtin_helpers::builtin_provider_config(&provider.name)
+            });
             if config.is_none() {
                 tracing::debug!(
                     model_key = %key,
@@ -3517,7 +3531,7 @@ pub(crate) fn resolve_model_list(
                     "provider ref has no trusted config; failing closed with an empty command"
                 );
             }
-            provider.attach_trusted_config(config);
+            provider.attach_trusted_config(config.as_ref());
         }
     }
     {
@@ -4726,6 +4740,10 @@ pub(crate) fn first_own_credential(
         .or_else(|| env_key.and_then(EnvKeys::resolve_value))
 }
 /// Priority: model api_key/env_key > cached auth-provider token > session token > XAI_API_KEY.
+///
+/// The last two branches carry *first-party* credentials, so they are structurally guarded by
+/// [`first_party_credential_permitted`]: the guard holds regardless of branch order, unlike the
+/// earlier scheme where isolation relied on the auth-provider branch preceding the session branch.
 pub(crate) fn resolve_credentials(
     model: &ModelEntry,
     session_key: Option<&str>,
@@ -4745,6 +4763,7 @@ pub(crate) fn resolve_credentials(
             xai_chat_state::AuthType::ApiKey,
         )
     } else if let Some(key) = session_key
+        && first_party_credential_permitted(model, &info.base_url)
         && crate::auth::backend::AuthBackend::may_receive_session(
             &crate::auth::backend::ActiveAuthBackend::default(),
             &info.base_url,
@@ -4755,7 +4774,12 @@ pub(crate) fn resolve_credentials(
             info.base_url.clone(),
             xai_chat_state::AuthType::SessionToken,
         )
-    } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env() {
+    } else if let Ok(key) = crate::agent::auth_method::read_xai_api_key_env()
+        && first_party_credential_permitted(
+            model,
+            model.api_base_url.as_deref().unwrap_or(&info.base_url),
+        )
+    {
         let url = model
             .api_base_url
             .clone()
@@ -4790,6 +4814,25 @@ pub(crate) fn resolve_credentials(
         auth_type,
         auth_scheme,
     }
+}
+/// Structural session-isolation predicate: may `model`, routed at `wire_url`, receive a
+/// first-party credential (the session bearer or `XAI_API_KEY`)?
+///
+/// Two ordering-independent denials, so a future reshuffle of `resolve_credentials` branches
+/// cannot leak a first-party credential to a third party:
+///
+/// * a model carrying **any** auth-provider ref (a real helper or the fail-closed guard that
+///   `resolve_model_list` attaches to provider-tagged models on non-first-party hosts, judged by
+///   [`crate::util::is_xai_api_bearer_url`]) never falls through to a first-party credential;
+/// * a **known third-party vendor host** (data-driven from the non-first-party presets) never
+///   receives one under any configuration, provider-tagged or not.
+///
+/// Everything else (first-party hosts, loopback, custom enterprise gateways signed in with
+/// xAI-issued sessions) keeps its documented behavior; the backend's `may_receive_session`
+/// still has the final say for the session branch.
+fn first_party_credential_permitted(model: &ModelEntry, wire_url: &str) -> bool {
+    model.auth_provider.is_none()
+        && !crate::agent::provider_profiles::is_third_party_vendor_url(wire_url)
 }
 /// `disable_api_key_auth` at the credential seam: swap a first-party xAI API key for the IdP session.
 /// When no session is available the request fails and forces a login.
@@ -5119,6 +5162,10 @@ pub(crate) fn sampling_config_for_model(
         &api_backend,
         &credentials.base_url,
     );
+    // The x-grok-* identification headers stay on first-party destinations (loopback counts:
+    // tests and local dev proxies). Also drop the identifiers themselves so a serialized config
+    // handed to a third-party client carries nothing to leak.
+    let first_party_headers = crate::util::is_xai_api_url(&credentials.base_url);
     SamplerConfig {
         api_key: credentials.api_key,
         model: model_name,
@@ -5133,15 +5180,16 @@ pub(crate) fn sampling_config_for_model(
         query_params: info.query_params.clone(),
         env_http_headers: info.env_http_headers.clone(),
         context_window: info.context_window.get(),
-        client_version,
+        client_version: client_version.filter(|_| first_party_headers),
         reasoning_effort: info.reasoning_effort,
         force_http1: false,
         max_retries: info.max_retries,
         stream_tool_calls: info.stream_tool_calls.unwrap_or(false),
         idle_timeout_secs: None,
         client_identifier: None,
-        deployment_id,
-        user_id,
+        deployment_id: deployment_id.filter(|_| first_party_headers),
+        user_id: user_id.filter(|_| first_party_headers),
+        first_party_headers,
         origin_client: None,
         attribution_callback: None,
         bearer_resolver: None,

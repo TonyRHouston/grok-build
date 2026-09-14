@@ -73,6 +73,15 @@ pub struct SamplerConfig {
     pub user_id: Option<String>,
     pub client_version: Option<String>,
 
+    /// Whether the destination is a first-party xAI endpoint, computed by the shell (the sampler
+    /// never inspects URLs). Gates every `x-grok-*` identification header: conv/req/session/agent
+    /// ids, model-override, turn-idx, transient-retry, client-version, client-identifier,
+    /// deployment-id, and user-id. `false` (the default) sends none of them, so a construction
+    /// site that forgets to set it fails closed for privacy rather than leaking first-party
+    /// identifiers to a third-party host.
+    #[serde(default)]
+    pub first_party_headers: bool,
+
     /// Hook invoked on every 401 response with the bearer that was actually sent on the wire.
     /// Implementations typically compare it against a live credential source to tell a stale token from a server-rejected live one.
     /// `None` (default) is a no-op; the 401 arm still returns `SamplingError::Auth`.
@@ -136,6 +145,7 @@ impl Default for SamplerConfig {
             deployment_id: None,
             user_id: None,
             client_version: None,
+            first_party_headers: false,
             attribution_callback: None,
             bearer_resolver: None,
             supports_backend_search: false,

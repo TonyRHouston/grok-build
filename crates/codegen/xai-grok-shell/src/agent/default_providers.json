@@ -59,6 +59,7 @@
       "api_backend": "chat_completions",
       "auth_scheme": "bearer",
       "env_key": ["GITHUB_COPILOT_TOKEN", "GH_COPILOT_TOKEN"],
+      "auth_helper": "builtin:github-copilot-exchange",
       "extra_headers": {
         "Copilot-Integration-Id": "vscode-chat",
         "Editor-Version": "GrokBuild/1.0"
